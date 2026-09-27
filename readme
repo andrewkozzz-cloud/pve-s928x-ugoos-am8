@@ -1,1 +1,148 @@
 pve-s928x-ugoos-am8
+
+# Proxmox VE 9.2-1 (ARM64) for Ugoos AM8 (Amlogic S928X)
+
+Полное руководство и пошаговый опыт сборки нативного **Proxmox VE 9.2-1 ARM64** с кастомным ядром Linux с поддержкой **KVM / VirtIO / ZFS / Docker** для ТВ-бокса **Ugoos AM8** (Amlogic S928X / S928X-J, 4GB RAM, USB 3.0 SSD).
+
+> **Главный принцип сборки:** Мы **НЕ используем** CoreELEC или Armbian в качестве хостовой ОС. Используется нативный rootfs от Proxmox VE ARM64 (`pve-base.squashfs`), куда инжектируется ядро Linux и модули, скомпилированные из веток CoreELEC S928X для обеспечения полной аппаратной поддержки SoC Amlogic.
+
+---
+
+## 🛠 Архитектура стенда сборки
+
+* **Сборщик (Build Host):** Контейнер LXC (`linkARM`, IP `192.168.0.200`) на базе Proxmox (Intel N100, 32GB RAM).
+* **Целевое устройство (Target):** Ugoos AM8 (Amlogic S928X-J, 4GB DDR4, внешний USB 3.0 SSD).
+* **Исходники ядра:** CoreELEC 21 (Amlogic-ne, ядро Linux 5.15.x с патчами Amlogic/KVM).
+* **Целевая база ОС:** Proxmox VE 9.2-1 ARM64 (`pve-base.squashfs`).
+
+---
+
+## 🚀 Пошаговое руководство по сборке
+
+### Шаг 1. Подготовка окружения и компиляция ядра CoreELEC с KVM
+
+1. Клонируем исходники CoreELEC для S928X в сборочный контейнер LXC:
+   ```bash
+   cd /home/andrew
+   git clone [https://github.com/CoreELEC/CoreELEC.git](https://github.com/CoreELEC/CoreELEC.git) CoreELEC-S928X
+   cd CoreELEC-S928X
+Включаем поддержку KVM и виртуализации в конфигурации ядра (PROJECT=Amlogic-ne ARCH=aarch64):
+
+Bash
+# Запуск сборки проекта для генерации дерева исходников
+PROJECT=Amlogic-ne DEVICE=Amlogic-no ARCH=aarch64 make image
+После успешной компиляции скомпилированные компоненты находятся в папке build.CoreELEC-Amlogic-ne.aarch64-21/:
+
+Ядро (Image): build/linux-*/arch/arm64/boot/Image
+
+Дерево устройств (DTB): install_pkg/linux-*/usr/share/bootloader/device_trees/s5_s928x_ugoos_am8.dtb
+
+Модули ядра: install_pkg/linux-*/usr/lib/kernel-overlays/base/lib/modules/
+
+Шаг 2. Извлечение Proxmox Base RootFS (Обход ограничений LXC)
+Поскольку сборка выполняется внутри LXC-контейнера без прав mknod и доступа к loop-устройствам, распаковка файла .squashfs выполняется утилитой 7z напрямую в директорию, минуя монтирование дисковых образов:
+
+Bash
+mkdir -p /home/andrew/pve_target_root
+7z x /mnt/iso/pve-base.squashfs -o/home/andrew/pve_target_root/
+Шаг 3. Внедрение кастомного ядра, DTB и модулей в RootFS
+Создаем папку /boot и переносим ядро и DTB:
+
+Bash
+mkdir -p /home/andrew/pve_target_root/boot
+
+# Копируем бинарник ядра Image
+cp -v /home/andrew/CoreELEC-S928X/build.CoreELEC-Amlogic-ne.aarch64-21/build/linux-*/arch/arm64/boot/Image /home/andrew/pve_target_root/boot/Image
+
+# Копируем DTB под именем dtb.img
+cp -v /home/andrew/CoreELEC-S928X/build.CoreELEC-Amlogic-ne.aarch64-21/install_pkg/linux-*/usr/share/bootloader/device_trees/s5_s928x_ugoos_am8.dtb /home/andrew/pve_target_root/boot/dtb.img
+Копируем модули ядра и исправляем права доступа:
+
+Bash
+cp -av /home/andrew/CoreELEC-S928X/build.CoreELEC-Amlogic-ne.aarch64-21/install_pkg/linux-*/usr/lib/kernel-overlays/base/lib/modules/* /home/andrew/pve_target_root/lib/modules/
+chown -R root:root /home/andrew/pve_target_root/lib/modules/
+Шаг 4. Настройка загрузчика U-Boot (uEnv.txt)
+Создаем файл конфигурации U-Boot в /boot/uEnv.txt:
+
+Bash
+cat << 'EOF' > /home/andrew/pve_target_root/boot/uEnv.txt
+bootargs=root=LABEL=PVE_ROOT rootwait rw console=ttyAML0,115200n8 console=tty0 no_console_suspend earlycon=aml_uart,0xfe078000 audit=0 init=/sbin/init
+kernel_addr_r=0x08080000
+dtb_addr_r=0x08000000
+bootcmd=fatload mmc 1:1 ${kernel_addr_r} Image; fatload mmc 1:1 ${dtb_addr_r} dtb.img; booti ${kernel_addr_r} - ${dtb_addr_r}
+EOF
+Шаг 5. Конфигурация системы, сети и SSH
+Настраиваем /etc/fstab:
+
+Bash
+cat << 'EOF' > /home/andrew/pve_target_root/etc/fstab
+# <file system> <mount point> <type> <options> <dump> <pass>
+LABEL=PVE_ROOT  /             ext4   errors=remount-ro,noatime 0 1
+LABEL=BOOT      /boot         vfat   defaults 0 2
+proc            /proc         proc   defaults 0 0
+EOF
+Разрешаем вход под root по SSH и паролю:
+
+Bash
+mkdir -p /home/andrew/pve_target_root/etc/ssh
+
+cat << 'EOF' > /home/andrew/pve_target_root/etc/ssh/sshd_config
+Port 22
+PermitRootLogin yes
+PasswordAuthentication yes
+Subsystem sftp /usr/lib/openssh/sftp-server
+EOF
+Устанавливаем стартовый пароль root для первого входа:
+
+Bash
+PASS_HASH=$(openssl passwd -6 root)
+sed -i "s|^root:[^:]*:|root:${PASS_HASH}:|" /home/andrew/pve_target_root/etc/shadow
+Задаем имя хоста и редактируем /etc/hosts:
+
+Bash
+echo "pve-s928x" > /home/andrew/pve_target_root/etc/hostname
+
+cat << 'EOF' > /home/andrew/pve_target_root/etc/hosts
+127.0.0.1       localhost
+127.0.1.1       pve-s928x
+
+::1             localhost ip6-localhost ip6-loopback
+ff02::1         ip6-allnodes
+ff02::2         ip6-allrouters
+EOF
+Шаг 6. Упаковка и экспорт архива RootFS
+Для переноса собранной системы на рабочую станцию создаем сжатый архив .tar.gz:
+
+Bash
+cd /home/andrew
+tar -cvzf pve_target_root.tar.gz -C /home/andrew/pve_target_root .
+Загрузка архива на ПК (в PowerShell):
+
+PowerShell
+scp root@192.168.0.200:/home/andrew/pve_target_root.tar.gz .
+💾 Развертывание на целевой USB 3.0 SSD / SD-карту
+Структура диска:
+Раздел 1 (/dev/sdX1): FAT32, размер 512MB, метка BOOT
+
+Раздел 2 (/dev/sdX2): ext4, все оставшееся место, метка PVE_ROOT
+
+Команды развертывания (из Linux / WSL2):
+Bash
+# 1. Форматирование
+mkfs.vfat -F32 -n BOOT /dev/sdX1
+mkfs.ext4 -F -L PVE_ROOT /dev/sdX2
+
+# 2. Монтирование
+mkdir -p /mnt/pve_root /mnt/pve_boot
+mount /dev/sdX2 /mnt/pve_root
+mount /dev/sdX1 /mnt/pve_boot
+
+# 3. Распаковка RootFS
+tar -xvzf pve_target_root.tar.gz -C /mnt/pve_root/
+
+# 4. Копирование файлов загрузки на FAT32
+cp -av /mnt/pve_root/boot/* /mnt/pve_boot/
+
+# 5. Сброс кэша
+sync
+umount /mnt/pve_root /mnt/pve_boot
